@@ -426,9 +426,6 @@ pub struct RuntimeConfig {
 	///     retries: 4,
 	/// )
 	pub retry_config: RetryConfig,
-	#[cfg(feature = "crawl")]
-	#[serde(flatten)]
-	pub crawl: crate::crawl_client::CrawlConfig,
 }
 
 impl RuntimeConfig {
@@ -783,8 +780,6 @@ impl Default for RuntimeConfig {
 			max_kad_record_number: 2400000,
 			max_kad_record_size: 8192,
 			max_kad_provided_keys: 1024,
-			#[cfg(feature = "crawl")]
-			crawl: crate::crawl_client::CrawlConfig::default(),
 			origin: "external".to_string(),
 			operation_mode: KademliaMode::Client,
 			retry_config: RetryConfig::Exponential(ExponentialConfig {

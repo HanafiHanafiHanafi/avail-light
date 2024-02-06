@@ -2,6 +2,7 @@
 
 use avail_light::{
 	network::p2p,
+	telemetry::{self, otlp::MetricAttributes},
 	types::{CliOpts, IdentityConfig, LibP2PConfig, RuntimeConfig},
 };
 use clap::Parser;
@@ -10,8 +11,8 @@ use color_eyre::{
 	Result,
 };
 use libp2p::{multiaddr::Protocol, Multiaddr};
-use std::{fs, net::Ipv4Addr, path::Path};
-use tokio::sync::mpsc;
+use std::{fs, net::Ipv4Addr, path::Path, sync::Arc};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, metadata::ParseLevelError, warn, Level, Subscriber};
 use tracing_subscriber::{fmt::format, EnvFilter, FmtSubscriber};
 
@@ -98,14 +99,42 @@ async fn run() -> Result<()> {
 	}
 
 	let cfg_libp2p: LibP2PConfig = (&cfg).into();
-	let (id_keys, _peer_id) = p2p::keypair(&cfg_libp2p)?;
+	let (id_keys, peer_id) = p2p::keypair(&cfg_libp2p)?;
+
+	let metric_attributes = MetricAttributes {
+		role: client_role.into(),
+		peer_id,
+		ip: RwLock::new("".to_string()),
+		multiaddress: RwLock::new("".to_string()), // Default value is empty until first processed block triggers an update,
+		origin: cfg.origin.clone(),
+		avail_address: identity_cfg.avail_address.clone(),
+		operating_mode: cfg.operation_mode.to_string(),
+		partition_size: cfg
+			.block_matrix_partition
+			.map(|_| {
+				format!(
+					"{}/{}",
+					cfg.block_matrix_partition
+						.expect("partition doesn't exist")
+						.number,
+					cfg.block_matrix_partition
+						.expect("partition doesn't exist")
+						.fraction
+				)
+			})
+			.unwrap_or("n/a".to_string()),
+	};
+
+	let ot_metrics = Arc::new(
+		telemetry::otlp::initialize(cfg.ot_collector_endpoint.clone(), metric_attributes)
+			.wrap_err("Unable to initialize OpenTelemetry service")?,
+	);
 
 	// Create sender channel for P2P event loop commands
 	let (p2p_event_loop_sender, p2p_event_loop_receiver) = mpsc::unbounded_channel();
 
 	let p2p_event_loop = p2p::EventLoop::new(cfg_libp2p, &id_keys, cfg.is_fat_client());
-
-	let task_event_loop = tokio::spawn(p2p_event_loop.run(p2p_event_loop_receiver));
+	let task_event_loop = tokio::spawn(p2p_event_loop.run(ot_metrics, p2p_event_loop_receiver));
 
 	let p2p_client = p2p::Client::new(
 		p2p_event_loop_sender,

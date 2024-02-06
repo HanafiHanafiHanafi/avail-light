@@ -17,7 +17,7 @@ use libp2p::{
 	upnp, Multiaddr, PeerId, Swarm,
 };
 use rand::seq::SliceRandom;
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use tokio::{
 	sync::oneshot,
 	time::{interval_at, Instant, Interval},
@@ -26,6 +26,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
 	network::p2p::kad_mem_store::MemoryStore,
+	telemetry::{MetricCounter, MetricValue, Metrics},
 	types::{AgentVersion, IdentifyConfig, KademliaMode, LibP2PConfig},
 };
 
@@ -140,10 +141,10 @@ impl EventLoop {
 		}
 	}
 
-	pub async fn run(mut self, mut command_receiver: CommandReceiver) {
+	pub async fn run(mut self, metrics: Arc<impl Metrics>, mut command_receiver: CommandReceiver) {
 		loop {
 			tokio::select! {
-				event = self.swarm.next() => self.handle_event(event.expect("Swarm stream should be infinite")).await,
+				event = self.swarm.next() => self.handle_event(event.expect("Swarm stream should be infinite"), metrics.clone()).await,
 				command = command_receiver.recv() => match command {
 					Some(c) => self.handle_command(c).await,
 					// Command channel closed, thus shutting down the network event loop.
@@ -164,8 +165,12 @@ impl EventLoop {
 		}
 	}
 
-	#[tracing::instrument(level = "trace", skip(self))]
-	async fn handle_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
+	#[tracing::instrument(level = "trace", skip(self, metrics))]
+	async fn handle_event(
+		&mut self,
+		event: SwarmEvent<BehaviourEvent>,
+		metrics: Arc<impl Metrics>,
+	) {
 		match event {
 			SwarmEvent::Behaviour(BehaviourEvent::Kademlia(event)) => {
 				match event {
@@ -187,10 +192,13 @@ impl EventLoop {
 					kad::Event::PendingRoutablePeer { peer, address } => {
 						trace!("Pending routablePeer. Peer: {peer:?}.  Address: {address:?}");
 					},
-					kad::Event::InboundRequest { request } => {
-						match request {
-							InboundRequest::GetRecord { .. } => {},
-							InboundRequest::PutRecord { source, record, .. } => match record {
+					kad::Event::InboundRequest { request } => match request {
+						InboundRequest::GetRecord { .. } => {
+							metrics.count(MetricCounter::IncomingGetRecord).await;
+						},
+						InboundRequest::PutRecord { source, record, .. } => {
+							metrics.count(MetricCounter::IncomingPutRecord).await;
+							match record {
 								Some(rec) => {
 									let key = &rec.key;
 									trace!("Inbound PUT request record key: {key:?}. Source: {source:?}",);
@@ -201,9 +209,9 @@ impl EventLoop {
 									debug!("Received empty cell record from: {source:?}");
 									return;
 								},
-							},
-							_ => {},
-						}
+							}
+						},
+						_ => {},
 					},
 					kad::Event::ModeChanged { new_mode } => {
 						trace!("Kademlia mode changed: {new_mode:?}");
@@ -236,10 +244,10 @@ impl EventLoop {
 
 							match error {
 								kad::PutRecordError::QuorumFailed { key, .. } => {
-									self.handle_put_result(key, stats, true).await;
+									self.handle_put_result(key, stats, true, metrics).await;
 								},
 								kad::PutRecordError::Timeout { key, .. } => {
-									self.handle_put_result(key, stats, true).await;
+									self.handle_put_result(key, stats, true, metrics).await;
 								},
 							}
 						},
@@ -248,7 +256,7 @@ impl EventLoop {
 							if self.pending_kad_queries.remove(&id).is_none() {
 								return;
 							};
-							self.handle_put_result(record.key.clone(), stats, false)
+							self.handle_put_result(record.key.clone(), stats, false, metrics)
 								.await;
 						},
 						QueryResult::Bootstrap(result) => match result {
@@ -429,9 +437,14 @@ impl EventLoop {
 							self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
 						}
 					},
-					SwarmEvent::IncomingConnection { .. } => {},
-					SwarmEvent::IncomingConnectionError { .. } => {},
+					SwarmEvent::IncomingConnection { .. } => {
+						metrics.count(MetricCounter::IncomingConnection).await;
+					},
+					SwarmEvent::IncomingConnectionError { .. } => {
+						metrics.count(MetricCounter::IncomingConnectionError).await;
+					},
 					SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+						metrics.count(MetricCounter::ConnectionEstablished).await;
 						// Notify the connections we're waiting on that we've connected successfully
 						if let Some(ch) = self.pending_swarm_events.remove(&peer_id) {
 							_ = ch.send(Ok(()));
@@ -439,6 +452,8 @@ impl EventLoop {
 						self.establish_relay_circuit(peer_id);
 					},
 					SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+						metrics.count(MetricCounter::OutgoingConnectionError).await;
+
 						if let Some(peer_id) = peer_id {
 							// Notify the connections we're waiting on an error has occured
 							if let libp2p::swarm::DialError::WrongPeerId { .. } = &error {
@@ -541,7 +556,13 @@ impl EventLoop {
 		}
 	}
 
-	async fn handle_put_result(&mut self, key: RecordKey, stats: QueryStats, is_error: bool) {
+	async fn handle_put_result(
+		&mut self,
+		key: RecordKey,
+		stats: QueryStats,
+		is_error: bool,
+		metrics: Arc<impl Metrics>,
+	) {
 		let block_num = match key.clone().try_into() {
 			Ok(DHTKey::Cell(block_num, _, _)) => block_num,
 			Ok(DHTKey::Row(block_num, _)) => block_num,
@@ -566,10 +587,18 @@ impl EventLoop {
 				.unwrap_or_default();
 
 			if block.remaining_counter == 0 {
+				let success_rate = block.success_counter as f64 / block.total_count as f64;
 				info!(
 					"Cell upload success rate for block {block_num}: {}/{}. Duration: {}",
 					block.success_counter, block.total_count, block.time_stat
 				);
+				_ = metrics
+					.record(MetricValue::DHTPutSuccess(success_rate))
+					.await;
+
+				_ = metrics
+					.record(MetricValue::DHTPutDuration(block.time_stat as f64))
+					.await;
 			}
 
 			if self.is_fat_client {
