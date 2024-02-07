@@ -26,6 +26,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
 	network::p2p::kad_mem_store::MemoryStore,
+	shutdown::Controller,
 	telemetry::{MetricCounter, MetricValue, Metrics},
 	types::{AgentVersion, IdentifyConfig, KademliaMode, LibP2PConfig},
 };
@@ -85,6 +86,7 @@ pub struct EventLoop {
 	is_fat_client: bool,
 	/// Blocks we monitor for PUT success rate
 	active_blocks: HashMap<u32, BlockStat>,
+	shutdown: Controller<String>,
 	// Used for checking protocol version
 	identity_data: IdentifyConfig,
 }
@@ -113,7 +115,12 @@ impl TryFrom<RecordKey> for DHTKey {
 }
 
 impl EventLoop {
-	pub fn new(cfg: LibP2PConfig, id_keys: &Keypair, is_fat_client: bool) -> Self {
+	pub fn new(
+		cfg: LibP2PConfig,
+		id_keys: &Keypair,
+		is_fat_client: bool,
+		shutdown: Controller<String>,
+	) -> Self {
 		let bootstrap_interval = cfg.bootstrap_interval;
 		let kad_mode = cfg.kademlia.kademlia_mode.into();
 		let peer_id = id_keys.public().to_peer_id();
@@ -137,11 +144,18 @@ impl EventLoop {
 			},
 			is_fat_client,
 			active_blocks: Default::default(),
+			shutdown,
 			identity_data: cfg.identify,
 		}
 	}
 
 	pub async fn run(mut self, metrics: Arc<impl Metrics>, mut command_receiver: CommandReceiver) {
+		// shutdown will wait as long as this token is not dropped
+		let _delay_token = self
+			.shutdown
+			.delay_token()
+			.expect("There should not be any shutdowns at the begging of the P2P Event Loop");
+
 		loop {
 			tokio::select! {
 				event = self.swarm.next() => self.handle_event(event.expect("Swarm stream should be infinite"), metrics.clone()).await,
@@ -151,6 +165,9 @@ impl EventLoop {
 					None => break,
 				},
 				_ = self.bootstrap.timer.tick() => self.handle_periodic_bootstraps(),
+				// if the shutdown was triggered,
+				// break the loop immediately, proceed to the cleanup phase
+				_ = self.shutdown.triggered_shutdown() => break
 			}
 		}
 		self.disconnect_peers();

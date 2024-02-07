@@ -2,6 +2,7 @@
 
 use avail_light::{
 	network::p2p,
+	shutdown::Controller,
 	telemetry::{self, otlp::MetricAttributes},
 	types::{CliOpts, IdentityConfig, LibP2PConfig, RuntimeConfig},
 };
@@ -15,6 +16,9 @@ use std::{fs, net::Ipv4Addr, path::Path, sync::Arc};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, metadata::ParseLevelError, warn, Level, Subscriber};
 use tracing_subscriber::{fmt::format, EnvFilter, FmtSubscriber};
+
+#[cfg(feature = "network-analysis")]
+use avail_light::network::p2p::analyzer;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -53,7 +57,7 @@ fn parse_log_level(log_level: &str, default: Level) -> (Level, Option<ParseLevel
 		.unwrap_or_else(|parse_err| (default, Some(parse_err)))
 }
 
-async fn run() -> Result<()> {
+async fn run(shutdown: Controller<String>) -> Result<()> {
 	let opts = CliOpts::parse();
 
 	let mut cfg: RuntimeConfig = RuntimeConfig::default();
@@ -133,8 +137,12 @@ async fn run() -> Result<()> {
 	// Create sender channel for P2P event loop commands
 	let (p2p_event_loop_sender, p2p_event_loop_receiver) = mpsc::unbounded_channel();
 
-	let p2p_event_loop = p2p::EventLoop::new(cfg_libp2p, &id_keys, cfg.is_fat_client());
-	let task_event_loop = tokio::spawn(p2p_event_loop.run(ot_metrics, p2p_event_loop_receiver));
+	let p2p_event_loop =
+		p2p::EventLoop::new(cfg_libp2p, &id_keys, cfg.is_fat_client(), shutdown.clone());
+
+	let task_event_loop = tokio::spawn(
+		shutdown.with_cancel(p2p_event_loop.run(ot_metrics.clone(), p2p_event_loop_receiver)),
+	);
 
 	let p2p_client = p2p::Client::new(
 		p2p_event_loop_sender,
@@ -156,7 +164,7 @@ async fn run() -> Result<()> {
 
 	let p2p_clone = p2p_client.to_owned();
 	let cfg_clone = cfg.to_owned();
-	let task_bootstrap = tokio::spawn(async move {
+	let task_bootstrap = tokio::spawn(shutdown.with_cancel(async move {
 		info!("Bootstraping the DHT with bootstrap nodes...");
 		let bs_result = p2p_clone
 			.bootstrap_on_startup(cfg_clone.bootstraps.iter().map(Into::into).collect())
@@ -169,14 +177,103 @@ async fn run() -> Result<()> {
 				error!("Bootstrap process: {e:?}.");
 			},
 		}
-	});
+	}));
 
 	let (_, _) = tokio::join!(task_event_loop, task_bootstrap);
 
 	Ok(())
 }
 
+fn install_panic_hooks(shutdown: Controller<String>) -> Result<()> {
+	// initialize color-eyre hooks
+	let (panic_hook, eyre_hook) = color_eyre::config::HookBuilder::default()
+		.display_location_section(true)
+		.display_env_section(true)
+		.into_hooks();
+
+	// install hook as global handler
+	eyre_hook.install()?;
+
+	std::panic::set_hook(Box::new(move |panic_info| {
+		// trigger shutdown to stop other tasks if panic occurrs
+		let _ = shutdown.trigger_shutdown("Panic occurred, shuting down".to_string());
+
+		let msg = format!("{}", panic_hook.panic_report(panic_info));
+		error!("Error: {}", strip_ansi_escapes::strip_str(msg));
+
+		#[cfg(debug_assertions)]
+		{
+			// better-panic stacktrace that is only enabled when debugging
+			better_panic::Settings::auto()
+				.most_recent_first(false)
+				.lineno_suffix(true)
+				.verbosity(better_panic::Verbosity::Medium)
+				.create_panic_handler()(panic_info);
+		}
+	}));
+	Ok(())
+}
+
+/// This utility function returns a [`Future`] that completes upon
+/// receiving each of the default termination signals.
+///
+/// On Unix-based systems, these signals are Ctrl-C (SIGINT) or SIGTERM,
+/// and on Windows, they are Ctrl-C, Ctrl-Close, Ctrl-Shutdown.
+async fn user_signal() {
+	let ctrl_c = tokio::signal::ctrl_c();
+	#[cfg(all(unix, not(windows)))]
+	{
+		let sig = async {
+			let mut os_sig =
+				tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+			os_sig.recv().await;
+			std::io::Result::Ok(())
+		};
+
+		tokio::select! {
+			_ = ctrl_c => {},
+			_ = sig => {}
+		}
+	}
+
+	#[cfg(all(not(unix), windows))]
+	{
+		let ctrl_close = async {
+			let mut sig = tokio::signal::windows::ctrl_close()?;
+			sig.recv().await;
+			std::io::Result::Ok(())
+		};
+		let ctrl_shutdown = async {
+			let mut sig = tokio::signal::windows::ctrl_shutdown()?;
+			sig.recv().await;
+			std::io::Result::Ok(())
+		};
+		tokio::select! {
+			_ = ctrl_c => {},
+			_ = ctrl_close => {},
+			_ = ctrl_shutdown => {},
+		}
+	}
+}
+
 #[tokio::main]
 pub async fn main() -> Result<()> {
-	run().await
+	let shutdown = Controller::new();
+
+	// install custom panic hooks
+	install_panic_hooks(shutdown.clone())?;
+
+	// spawn a task to watch for ctrl-c signals from user to trigger the shutdown
+	tokio::spawn(shutdown.with_trigger("user signaled shutdown".to_string(), user_signal()));
+
+	if let Err(error) = run(shutdown.clone()).await {
+		error!("{error:#}");
+		return Err(error.wrap_err("Starting Light Client failed"));
+	};
+
+	let reason = shutdown.completed_shutdown().await;
+
+	// we are not logging error here since expectation is
+	// to log terminating condition before sending message to this channel
+	Err(eyre!(reason).wrap_err("Running Light Client encountered an error"))
 }
