@@ -179,8 +179,10 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 		}
 	}));
 
-	let (_, _) = tokio::join!(task_event_loop, task_bootstrap);
+	#[cfg(feature = "network-analysis")]
+	tokio::task::spawn(shutdown.with_cancel(analyzer::start_traffic_analyzer(cfg.port, 10)));
 
+	let (_, _) = tokio::join!(task_event_loop, task_bootstrap);
 	Ok(())
 }
 
