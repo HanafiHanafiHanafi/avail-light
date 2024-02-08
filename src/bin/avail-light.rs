@@ -2,7 +2,7 @@
 
 use avail_light::{
 	data,
-	network::{p2p, rpc},
+	network::{self, p2p, rpc},
 	shutdown::Controller,
 	telemetry::{self, otlp::MetricAttributes},
 	types::{CliOpts, IdentityConfig, LibP2PConfig, RuntimeConfig, State},
@@ -19,7 +19,7 @@ use std::{
 	path::Path,
 	sync::{Arc, Mutex},
 };
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{error, info, metadata::ParseLevelError, trace, warn, Level, Subscriber};
 use tracing_subscriber::{fmt::format, EnvFilter, FmtSubscriber};
 
@@ -197,7 +197,7 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 	trace!("Public params ({public_params_len}): hash: {public_params_hash}");
 
 	let state = Arc::new(Mutex::new(State::default()));
-	let (_rpc_client, rpc_events, rpc_event_loop) = rpc::init(
+	let (rpc_client, rpc_events, rpc_event_loop) = rpc::init(
 		db.clone(),
 		state.clone(),
 		&cfg.full_node_ws,
@@ -207,18 +207,11 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 
 	// Subscribing to RPC events before first event is published
 	let first_header_rpc_event_receiver = rpc_events.subscribe();
-	let mut temp_rpc_event_receiver = rpc_events.subscribe();
+	let client_rpc_event_receiver = rpc_events.subscribe();
+
 	// spawn the RPC Network task for Event Loop to run in the background
 	// and shut it down, without delays
 	let rpc_event_loop_handle = tokio::spawn(shutdown.with_cancel(rpc_event_loop.run()));
-
-	tokio::spawn(async move {
-		loop {
-			let Ok(_) = temp_rpc_event_receiver.recv().await else {
-				break;
-			};
-		}
-	});
 
 	info!("Waiting for first finalized header...");
 	let block_header = match shutdown
@@ -250,6 +243,38 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 	};
 
 	state.lock().unwrap().latest = block_header.number;
+	let (block_tx, mut block_rx) = broadcast::channel::<avail_light::types::BlockVerified>(1 << 7);
+
+	tokio::spawn(async move {
+		loop {
+			let Ok(_) = block_rx.recv().await else {
+			    break;
+			};
+		};
+	});
+
+	let channels = avail_light::types::ClientChannels {
+		block_sender: block_tx,
+		rpc_event_receiver: client_rpc_event_receiver,
+	};
+
+	if let Some(_partition) = cfg.block_matrix_partition {
+	} else {
+		let light_client = avail_light::light_client::new(db.clone());
+
+		let light_network_client = network::new(p2p_client, rpc_client, pp, cfg.disable_rpc);
+
+		tokio::task::spawn(shutdown.with_cancel(avail_light::light_client::run(
+			light_client,
+			light_network_client,
+			(&cfg).into(),
+			ot_metrics,
+			state.clone(),
+			channels,
+			shutdown.clone(),
+		)));
+	}
+
 	let (_, _, _) = tokio::join!(task_event_loop, task_bootstrap, rpc_event_loop_handle);
 	Ok(())
 }
