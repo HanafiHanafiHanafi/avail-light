@@ -1,10 +1,11 @@
 #![doc = include_str!("../../README.md")]
 
 use avail_light::{
-	network::p2p,
+	data,
+	network::{p2p, rpc},
 	shutdown::Controller,
 	telemetry::{self, otlp::MetricAttributes},
-	types::{CliOpts, IdentityConfig, LibP2PConfig, RuntimeConfig},
+	types::{CliOpts, IdentityConfig, LibP2PConfig, RuntimeConfig, State},
 };
 use clap::Parser;
 use color_eyre::{
@@ -12,9 +13,14 @@ use color_eyre::{
 	Result,
 };
 use libp2p::{multiaddr::Protocol, Multiaddr};
-use std::{fs, net::Ipv4Addr, path::Path, sync::Arc};
+use std::{
+	fs,
+	net::Ipv4Addr,
+	path::Path,
+	sync::{Arc, Mutex},
+};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{error, info, metadata::ParseLevelError, warn, Level, Subscriber};
+use tracing::{error, info, metadata::ParseLevelError, trace, warn, Level, Subscriber};
 use tracing_subscriber::{fmt::format, EnvFilter, FmtSubscriber};
 
 #[cfg(feature = "network-analysis")]
@@ -102,6 +108,8 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 		Err(eyre!("Bootstrap node list must not be empty. Either use a '--network' flag or add a list of bootstrap nodes in the configuration file"))?
 	}
 
+	let db = data::init_db(&cfg.avail_path).wrap_err("Cannot initialize database")?;
+
 	let cfg_libp2p: LibP2PConfig = (&cfg).into();
 	let (id_keys, peer_id) = p2p::keypair(&cfg_libp2p)?;
 
@@ -182,7 +190,67 @@ async fn run(shutdown: Controller<String>) -> Result<()> {
 	#[cfg(feature = "network-analysis")]
 	tokio::task::spawn(shutdown.with_cancel(analyzer::start_traffic_analyzer(cfg.port, 10)));
 
-	let (_, _) = tokio::join!(task_event_loop, task_bootstrap);
+	let pp = Arc::new(kate_recovery::couscous::public_params());
+	let raw_pp = pp.to_raw_var_bytes();
+	let public_params_hash = hex::encode(sp_core::blake2_128(&raw_pp));
+	let public_params_len = hex::encode(raw_pp).len();
+	trace!("Public params ({public_params_len}): hash: {public_params_hash}");
+
+	let state = Arc::new(Mutex::new(State::default()));
+	let (_rpc_client, rpc_events, rpc_event_loop) = rpc::init(
+		db.clone(),
+		state.clone(),
+		&cfg.full_node_ws,
+		&cfg.genesis_hash,
+		cfg.retry_config.clone(),
+	);
+
+	// Subscribing to RPC events before first event is published
+	let first_header_rpc_event_receiver = rpc_events.subscribe();
+	let mut temp_rpc_event_receiver = rpc_events.subscribe();
+	// spawn the RPC Network task for Event Loop to run in the background
+	// and shut it down, without delays
+	let rpc_event_loop_handle = tokio::spawn(shutdown.with_cancel(rpc_event_loop.run()));
+
+	tokio::spawn(async move {
+		loop {
+			let Ok(_) = temp_rpc_event_receiver.recv().await else {
+				break;
+			};
+		}
+	});
+
+	info!("Waiting for first finalized header...");
+	let block_header = match shutdown
+		.with_cancel(rpc::wait_for_finalized_header(
+			first_header_rpc_event_receiver,
+			360,
+		))
+		.await
+	{
+		Ok(Err(report)) => {
+			if !rpc_event_loop_handle.is_finished() {
+				return Err(report);
+			}
+			let Ok(Ok(Err(event_loop_error))) = rpc_event_loop_handle.await else {
+				return Err(report);
+			};
+			return Err(eyre!(event_loop_error));
+		},
+		Ok(Ok(num)) => num,
+		Err(shutdown_reason) => {
+			if !rpc_event_loop_handle.is_finished() {
+				return Err(eyre!(shutdown_reason));
+			}
+			let Ok(Ok(Err(event_loop_error))) = rpc_event_loop_handle.await else {
+				return Err(eyre!(shutdown_reason));
+			};
+			return Err(eyre!(event_loop_error));
+		},
+	};
+
+	state.lock().unwrap().latest = block_header.number;
+	let (_, _, _) = tokio::join!(task_event_loop, task_bootstrap, rpc_event_loop_handle);
 	Ok(())
 }
 
